@@ -1,8 +1,209 @@
-import { getPreferenceValues, showToast, Toast, AI } from "@raycast/api";
+import { AI, getPreferenceValues, showToast, Toast } from "@raycast/api";
 import http from "http";
 
 interface Preferences {
   port: string;
+}
+
+
+interface Message {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+}
+
+/**
+ * Formats messages into model-specific prompt formats
+ * Different AI models expect different prompt structures
+ * @param messages Array of chat messages
+ * @param modelId Model identifier string
+ * @returns Formatted prompt string
+ */
+function formatPromptForModel(messages: Message[], modelId: string): string {
+  // Convert to lowercase for case-insensitive matching
+  const modelIdLower = modelId.toLowerCase();
+
+  // Llama 3.1 and newer versions
+  if (modelIdLower.includes('llama3.1') || modelIdLower.includes('llama-4')) {
+    return formatLlama3(messages);
+  }
+
+  // Llama 3 (legacy)
+  if (modelIdLower.includes('llama3') || modelIdLower.includes('llama-3.3')) {
+    return formatLlama3(messages);
+  }
+
+  // Llama 2 and CodeLlama
+  if (modelIdLower.includes('llama2') || modelIdLower.includes('codellama')) {
+    return formatLlama2(messages);
+  }
+
+  // Mistral family models
+  if (modelIdLower.includes('mistral') || modelIdLower.includes('nemo') || modelIdLower.includes('codestral')) {
+    return formatMistral(messages);
+  }
+
+  // Anthropic Claude family
+  if (modelIdLower.includes('anthropic') || modelIdLower.includes('claude')) {
+    return formatClaude(messages);
+  }
+
+  // Grok family
+  if (modelIdLower.includes('grok')) {
+    return formatGrok(messages);
+  }
+
+  // DeepSeek family (typically compatible with Llama2 format)
+  if (modelIdLower.includes('deepseek')) {
+    return formatLlama2(messages);
+  }
+
+  // OpenAI & Google Gemini
+  if (modelIdLower.includes('openai') || modelIdLower.includes('google') || modelIdLower.includes('gemini')) {
+    // These models natively use JSON format via their APIs.
+    // This is a fallback string representation for compatibility.
+    return formatSimpleChat(messages, modelIdLower.includes('openai'));
+  }
+
+  // Default format for unknown models
+  return formatDefault(messages);
+}
+
+// -----------------------------------------------------------------------------
+// Model-specific formatting functions
+// -----------------------------------------------------------------------------
+
+/**
+ * Llama 3 & 3.1 format
+ * Uses special tokens: <|begin_of_text|>, <|start_header_id|>, <|end_header_id|>, <|eot_id|>
+ */
+function formatLlama3(messages: Message[]): string {
+  let prompt = '<|begin_of_text|>';
+
+  messages.forEach(msg => {
+    const role = msg.role === 'assistant' ? 'assistant' : (msg.role === 'system' ? 'system' : 'user');
+    prompt += `<|start_header_id|>${role}<|end_header_id|>\n\n${msg.content}<|eot_id|>`;
+  });
+
+  prompt += `<|start_header_id|>assistant<|end_header_id|>\n\n`;
+  return prompt;
+}
+
+/**
+ * Llama 2 format
+ * Uses special tokens: <s>, [INST], [/INST], <<SYS>>
+ */
+function formatLlama2(messages: Message[]): string {
+  let prompt = '<s>';
+  let hasSystemPrompt = false;
+
+  // Handle system message
+  if (messages[0]?.role === 'system') {
+    prompt += `[INST] <<SYS>>\n${messages[0].content}\n<</SYS>>\n\n`;
+    hasSystemPrompt = true;
+  }
+
+  // Process remaining messages
+  messages.slice(hasSystemPrompt ? 1 : 0).forEach((msg) => {
+    if (msg.role === 'user') {
+      prompt += `[INST] ${msg.content} [/INST]`;
+    } else if (msg.role === 'assistant') {
+      prompt += ` ${msg.content} </s><s>`;
+    }
+  });
+
+  // Remove trailing <s> if present
+  if (prompt.endsWith('<s>')) {
+    prompt = prompt.slice(0, -3);
+  }
+
+  return prompt;
+}
+
+/**
+ * Mistral format
+ * Uses special tokens: <s>, [INST], [/INST]
+ */
+function formatMistral(messages: Message[]): string {
+  let prompt = '<s>';
+
+  messages.forEach(msg => {
+    if (msg.role === 'user') {
+      prompt += `[INST] ${msg.content} [/INST]`;
+    } else if (msg.role === 'assistant') {
+      prompt += `${msg.content}</s>`;
+    }
+  });
+
+  return prompt;
+}
+
+/**
+ * Claude format
+ * Uses conversational format with "User:" and "Assistant:" prefixes
+ */
+function formatClaude(messages: Message[]): string {
+  let prompt = '';
+
+  messages.forEach(msg => {
+    if (msg.role === 'system') {
+      // Claude 3+ recommends placing system instructions before the first User message
+      prompt += `${msg.content}\n\n`;
+    } else if (msg.role === 'user') {
+      prompt += `User: ${msg.content}\n\n`;
+    } else if (msg.role === 'assistant') {
+      prompt += `Assistant: ${msg.content}\n\n`;
+    }
+  });
+
+  prompt += 'Assistant:';
+  return prompt;
+}
+
+/**
+ * Grok format
+ * Uses simple instruction format with clear role labels
+ */
+function formatGrok(messages: Message[]): string {
+  let prompt = '';
+
+  messages.forEach(msg => {
+    if (msg.role === 'system') {
+      prompt += `System Instruction:\n${msg.content}\n\n`;
+    } else if (msg.role === 'user') {
+      prompt += `User:\n${msg.content}\n\n`;
+    } else if (msg.role === 'assistant') {
+      prompt += `Assistant:\n${msg.content}\n\n`;
+    }
+  });
+
+  prompt += 'Assistant:\n';
+  return prompt;
+}
+
+/**
+ * Simple chat format for OpenAI/Gemini
+ * This is a fallback as these models primarily use JSON message arrays
+ */
+function formatSimpleChat(messages: Message[], isSystemSupported: boolean): string {
+  return messages
+    .map(msg => {
+      // Gemini doesn't support system role, merge it into user message
+      if (!isSystemSupported && msg.role === 'system') {
+        return `(System Instruction: ${msg.content})`;
+      }
+      return `${msg.role}: ${msg.content}`;
+    })
+    .join('\n\n');
+}
+
+/**
+ * Default format for unknown models
+ * Uses simple <role>: content format
+ */
+function formatDefault(messages: Message[]): string {
+  return messages
+    .map(msg => `<${msg.role}>: ${msg.content}`)
+    .join('\n\n');
 }
 
 export default async function Command() {
@@ -59,8 +260,8 @@ export default async function Command() {
           return;
         }
 
-        const lastMessage = requestData.messages[requestData.messages.length - 1];
-        const prompt = lastMessage.content;
+        const prompt = formatPromptForModel(requestData.messages, model);
+
         if (!prompt) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Missing 'content' in the last message" }));
@@ -73,7 +274,7 @@ export default async function Command() {
         console.log("Will send prompt to model:", model, prompt);
 
         // Call AI.ask with the prompt.
-        const answer = AI.ask(prompt, {model: AI.Model[model]});
+        const answer = AI.ask(prompt, { model: AI.Model[model] });
 
         if (streamMode) {
           // Streaming response: set headers for SSE.
@@ -145,5 +346,5 @@ export default async function Command() {
     console.log("Server has been shut down.");
   });
 
-  await new Promise(() => {});
+  await new Promise(() => { });
 }
